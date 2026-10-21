@@ -1,0 +1,284 @@
+<!-- core/templates/core/lesson_player.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ lesson.title }} | Modern Academy</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center justify-center relative">
+    {% csrf_token %}
+    <!-- Top Navigation -->
+    <nav class="absolute top-0 w-full p-4 flex justify-between items-center z-10">
+        <a href="{% url 'dashboard' %}" class="text-gray-300 hover:text-white flex items-center gap-2">
+            <span>← Back to Dashboard</span>
+        </a>
+        <div class="flex items-center gap-4">
+            <span id="ai-status" class="text-sm text-yellow-400 font-semibold"></span>
+            <h1 class="text-xl font-bold">{{ lesson.title }}</h1>
+        </div>
+    </nav>
+
+    <!-- The YouTube Player Container -->
+    <div class="w-full max-w-4xl aspect-video bg-black rounded-xl overflow-hidden shadow-2xl relative">
+        <div id="video-player" class="w-full h-full"></div>
+        
+        <!-- The Pop Quiz Modal (Hidden by default) -->
+        <div id="quiz-modal" class="hidden absolute inset-0 bg-black/90 flex flex-col items-center justify-center p-8 text-center backdrop-blur-sm z-20">
+            <h2 class="text-4xl font-bold text-yellow-400 mb-6">🚨 Pop Quiz! 🚨</h2>
+            
+            <!-- Loading State -->
+            <div id="loading-state" class="text-gray-300 animate-pulse">
+                <p class="text-xl">Gemini is preparing your next challenge...</p>
+            </div>
+            
+            <!-- Quiz Form (Populated dynamically via JS) -->
+            <form id="quiz-form" class="hidden w-full max-w-2xl bg-gray-800 p-8 rounded-xl shadow-lg border border-gray-700">
+                <p id="question-text" class="text-2xl font-semibold mb-8 text-white"></p>
+                <div id="options-container" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Radio buttons injected here -->
+                </div>
+                <button type="submit" class="mt-8 w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold py-3 px-6 rounded-lg transition">
+                    Submit Answer
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- YouTube IFrame API & Interruption Logic -->
+    <script>
+        let player;
+        let timeChecker;
+        let preloadedQuizzes = []; 
+        let pendingEndQuizzes = []; 
+        let currentEndQuizIndex = 0;
+        let hasFetchedQuizzes = false;
+        let hintCache = {}; // Cache to avoid repeating API calls on wrong answers
+
+        var tag = document.createElement('script');
+        tag.src = "https://www.youtube.com/iframe_api";
+        var firstScriptTag = document.getElementsByTagName('script')[0];
+        firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+
+        function onYouTubeIframeAPIReady() {
+            player = new YT.Player('video-player', {
+                videoId: '{{ lesson.youtube_id }}', 
+                playerVars: { 'autoplay': 1, 'controls': 1 },
+                events: {
+                    'onReady': onPlayerReady,
+                    'onStateChange': onPlayerStateChange
+                }
+            });
+        }
+
+        function onPlayerReady(event) {
+            console.log("Player ready. Video will prefetch curriculum on initial play.");
+        }
+
+        function onPlayerStateChange(event) {
+            // Fetch curriculum once when the video first plays
+            if (event.data === YT.PlayerState.PLAYING && !hasFetchedQuizzes) {
+                hasFetchedQuizzes = true; 
+                
+                // 1. PAUSE the video immediately so the timeline doesn't race ahead
+                player.pauseVideo();
+                
+                const videoId = '{{ lesson.youtube_id }}';
+                const duration = Math.floor(player.getDuration()) || 448; 
+                
+                const statusEl = document.getElementById('ai-status');
+                if (statusEl) statusEl.innerText = "🤖 Generating curriculum... (Video paused)";
+
+                fetch(`/api/generate-all-quizzes/?video_id=${videoId}&duration=${duration}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data.error && data.quizzes) {
+                            preloadedQuizzes = data.quizzes;
+                            if (statusEl) statusEl.innerText = "⚡ Ready";
+                            console.table(preloadedQuizzes.map(q => ({ time: q.trigger_second, question: q.question })));
+                            
+                            // 2. RESUME the video now that quizzes are locked and loaded
+                            player.playVideo();
+                        } else {
+                            if (statusEl) statusEl.innerText = "⚠️ API Busy";
+                            console.error(data.error);
+                            player.playVideo(); // Let them watch anyway if it fails
+                        }
+                    })
+                    .catch(err => {
+                        if (statusEl) statusEl.innerText = "⚠️ Offline";
+                        console.error(err);
+                        player.playVideo(); 
+                    });
+            }
+            
+            // Manage checking timer while playback occurs
+            if (event.data === YT.PlayerState.PLAYING) {
+                timeChecker = setInterval(checkTime, 1000); 
+            } else {
+                clearInterval(timeChecker);
+            }
+            
+            // Handle video completion & final mastery exam
+            if (event.data === YT.PlayerState.ENDED) {
+                const duration = Math.floor(player.getDuration());
+                pendingEndQuizzes = preloadedQuizzes.filter(q => q.trigger_second >= duration - 5); 
+                currentEndQuizIndex = 0;
+                
+                if (pendingEndQuizzes.length > 0) {
+                    renderQuiz(pendingEndQuizzes[currentEndQuizIndex]);
+                } else {
+                    saveProgressAndPoints();
+                }
+            }
+        }
+        function checkTime() {
+            let currentTime = Math.floor(player.getCurrentTime());
+            
+            // 1. Silently discard any quizzes the user fast-forwarded completely past (more than 2 seconds over)
+            preloadedQuizzes = preloadedQuizzes.filter(q => currentTime <= q.trigger_second + 2);
+            
+            // 2. Now, only trigger a quiz if we are currently inside its 2-second window
+            let activeQuizIndex = preloadedQuizzes.findIndex(q => currentTime >= q.trigger_second);
+            
+            if (activeQuizIndex !== -1 && preloadedQuizzes[activeQuizIndex].trigger_second < (player.getDuration() - 5)) {
+                player.pauseVideo();
+                renderQuiz(preloadedQuizzes[activeQuizIndex]);
+                preloadedQuizzes.splice(activeQuizIndex, 1); 
+            }
+        }
+
+        function renderQuiz(quizData) {
+            document.getElementById('quiz-modal').classList.remove('hidden');
+            
+            const loadingState = document.getElementById('loading-state');
+            if (loadingState) loadingState.classList.add('hidden');
+            
+            const form = document.getElementById('quiz-form');
+            form.classList.remove('hidden');
+            document.getElementById('question-text').innerText = quizData.question;
+            
+            const optionsHtml = `
+                <label class="block p-4 border border-gray-600 rounded cursor-pointer hover:bg-gray-700">
+                    <input type="radio" name="answer" value="${quizData.option_a}" class="mr-2"> ${quizData.option_a}
+                </label>
+                <label class="block p-4 border border-gray-600 rounded cursor-pointer hover:bg-gray-700">
+                    <input type="radio" name="answer" value="${quizData.option_b}" class="mr-2"> ${quizData.option_b}
+                </label>
+                <label class="block p-4 border border-gray-600 rounded cursor-pointer hover:bg-gray-700">
+                    <input type="radio" name="answer" value="${quizData.option_c}" class="mr-2"> ${quizData.option_c}
+                </label>
+                <label class="block p-4 border border-gray-600 rounded cursor-pointer hover:bg-gray-700">
+                    <input type="radio" name="answer" value="${quizData.option_d}" class="mr-2"> ${quizData.option_d}
+                </label>
+                <input type="hidden" id="correct-answer" value="${quizData.correct_option}">
+            `;
+            document.getElementById('options-container').innerHTML = optionsHtml;
+            showFeedback("", ""); 
+        }
+
+        document.getElementById('quiz-form').addEventListener('submit', function(e) {
+            e.preventDefault(); 
+
+            const selectedOption = document.querySelector('input[name="answer"]:checked');
+            if (!selectedOption) {
+                showFeedback("Please select an answer before submitting.", "text-yellow-400");
+                return;
+            }
+
+            const userAnswer = selectedOption.value;
+            const correctAnswer = document.getElementById('correct-answer').value;
+            const submitBtn = document.querySelector('#quiz-form button[type="submit"]');
+
+            if (userAnswer === correctAnswer) {
+                hintCache = {}; // Clear hints for previous questions
+                
+                if (pendingEndQuizzes.length > 0) {
+                    currentEndQuizIndex++;
+                    if (currentEndQuizIndex < pendingEndQuizzes.length) {
+                        showFeedback("Correct! Next question...", "text-green-400");
+                        setTimeout(() => {
+                            renderQuiz(pendingEndQuizzes[currentEndQuizIndex]);
+                        }, 800);
+                    } else {
+                        document.getElementById('quiz-modal').classList.add('hidden');
+                        pendingEndQuizzes = [];
+                        saveProgressAndPoints();
+                    }
+                } else {
+                    document.getElementById('quiz-modal').classList.add('hidden');
+                    player.playVideo(); 
+                }
+            } else {
+                const questionText = document.getElementById('question-text').innerText;
+                const cacheKey = `${questionText}_${userAnswer}`;
+
+                // Use cached hint if already fetched for this answer
+                if (hintCache[cacheKey]) {
+                    showFeedback(`Hint: ${hintCache[cacheKey]}`, "text-blue-300");
+                    return;
+                }
+
+                showFeedback("Thinking of a hint...", "text-yellow-400 animate-pulse");
+                submitBtn.disabled = true;
+
+                const encodedQuestion = encodeURIComponent(questionText);
+                const encodedAnswer = encodeURIComponent(userAnswer);
+
+                // Fast text-only call (no heavy video upload)
+                fetch(`/api/generate-hint/?question=${encodedQuestion}&user_answer=${encodedAnswer}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        submitBtn.disabled = false;
+                        if (data.hint) {
+                            hintCache[cacheKey] = data.hint;
+                            showFeedback(`Hint: ${data.hint}`, "text-blue-300");
+                        } else {
+                            showFeedback("Incorrect. Try another option!", "text-red-400");
+                        }
+                    })
+                    .catch(error => {
+                        submitBtn.disabled = false;
+                        showFeedback("Incorrect. Try another option!", "text-red-400");
+                        console.error("Hint error:", error);
+                    });
+            }
+        });
+        
+        function saveProgressAndPoints() {
+            const csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+            
+            fetch('/api/mark-completed/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({ lesson_id: '{{ lesson.id }}' })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if(data.points_awarded) {
+                    alert("Mastery verified! 10 points awarded.");
+                }
+                window.location.href = "{% url 'dashboard' %}";
+            })
+            .catch(error => console.error("Error saving progress:", error));
+        }
+
+        function showFeedback(message, colorClass) {
+            let feedbackElement = document.getElementById('quiz-feedback');
+            
+            if (!feedbackElement) {
+                feedbackElement = document.createElement('p');
+                feedbackElement.id = 'quiz-feedback';
+                document.getElementById('quiz-form').appendChild(feedbackElement);
+            }
+            
+            feedbackElement.className = `mt-4 text-xl font-bold ${colorClass}`;
+            feedbackElement.innerText = message;
+        }
+    </script>
+</body>
+</html>
